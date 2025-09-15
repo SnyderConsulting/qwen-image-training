@@ -639,6 +639,52 @@ class InitialLayer(nn.Module):
         temb = self.time_text_embed(timestep, hidden_states)
 
         img_shapes = img_shapes.tolist()
+        # Older cached datasets (and some third-party tools) stored the latent
+        # spatial shapes without the frame dimension which the upstream
+        # QwenImage positional embedding code expects.  That results in
+        # ``video_fhw`` tuples of length two and a ``ValueError`` when the
+        # diffusers implementation tries to unpack ``(frame, height, width)``.
+        # Normalise the shapes here so every entry is an explicit
+        # ``(frame, height, width)`` triple before we hand them to
+        # ``self.pos_embed``.
+        normalised_img_shapes = []
+        for sample_shapes in img_shapes:
+            if isinstance(sample_shapes, (list, tuple)) and (
+                not sample_shapes
+                or not isinstance(sample_shapes[0], (list, tuple))
+            ):
+                # Some cached datasets store a single image shape directly as a
+                # flat sequence instead of ``[(frame, height, width)]``. Wrap
+                # it so that the downstream loop can treat the data uniformly.
+                sample_shapes = [sample_shapes]
+            sample_list = []
+            for shape in sample_shapes:
+                # Convert tensors nested inside the python list back into a
+                # python sequence if necessary.
+                if hasattr(shape, "tolist"):
+                    shape = shape.tolist()
+
+                if isinstance(shape, (list, tuple)):
+                    if len(shape) == 3:
+                        frame, height, width = shape
+                    elif len(shape) == 2:
+                        # Assume a single frame when the cached metadata only
+                        # stored the spatial resolution.
+                        height, width = shape
+                        frame = 1
+                    else:
+                        raise ValueError(
+                            f"Unexpected img shape length {len(shape)} for {shape}."
+                        )
+                else:
+                    raise TypeError(
+                        f"Unexpected img shape type {type(shape)} for {shape}."
+                    )
+
+                sample_list.append((int(frame), int(height), int(width)))
+            normalised_img_shapes.append(sample_list)
+
+        img_shapes = normalised_img_shapes
         txt_seq_lens = txt_seq_lens.tolist()
         vid_freqs, txt_freqs = self.pos_embed(
             img_shapes, txt_seq_lens, device=hidden_states.device
