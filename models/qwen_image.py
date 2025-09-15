@@ -638,7 +638,10 @@ class InitialLayer(nn.Module):
 
         temb = self.time_text_embed(timestep, hidden_states)
 
-        img_shapes = img_shapes.tolist()
+        original_img_shapes = img_shapes
+        if hasattr(img_shapes, "tolist"):
+            img_shapes = img_shapes.tolist()
+
         # Older cached datasets (and some third-party tools) stored the latent
         # spatial shapes without the frame dimension which the upstream
         # QwenImage positional embedding code expects.  That results in
@@ -684,7 +687,10 @@ class InitialLayer(nn.Module):
                 sample_list.append((int(frame), int(height), int(width)))
             normalised_img_shapes.append(sample_list)
 
-        img_shapes = normalised_img_shapes
+        if isinstance(original_img_shapes, torch.Tensor):
+            img_shapes = original_img_shapes.new_tensor(normalised_img_shapes)
+        else:
+            img_shapes = normalised_img_shapes
         txt_seq_lens = txt_seq_lens.tolist()
         vid_freqs, txt_freqs = self.pos_embed(
             img_shapes, txt_seq_lens, device=hidden_states.device
