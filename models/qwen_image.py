@@ -638,9 +638,15 @@ class InitialLayer(nn.Module):
 
         temb = self.time_text_embed(timestep, hidden_states)
 
-        original_img_shapes = img_shapes
-        if hasattr(img_shapes, "tolist"):
-            img_shapes = img_shapes.tolist()
+        # ---- Begin robust normalization of img_shapes ----
+        # Always operate on python lists; the positional embedding expects ragged lists.
+        if isinstance(img_shapes, torch.Tensor):
+            img_shapes = img_shapes.detach().cpu().tolist()
+        # Some pipelines pass a flat [F,H,W]; wrap into [[F,H,W]] so the outer loop sees "per-sample" items.
+        if isinstance(img_shapes, (list, tuple)) and img_shapes and not isinstance(img_shapes[0], (list, tuple)):
+            img_shapes = [list(img_shapes)]
+        elif not isinstance(img_shapes, (list, tuple)):
+            raise TypeError(f"img_shapes must be a sequence; got {type(img_shapes)}")
 
         # Older cached datasets (and some third-party tools) stored the latent
         # spatial shapes without the frame dimension which the upstream
@@ -687,14 +693,21 @@ class InitialLayer(nn.Module):
                 sample_list.append((int(frame), int(height), int(width)))
             normalised_img_shapes.append(sample_list)
 
-        if isinstance(original_img_shapes, torch.Tensor):
-            img_shapes = original_img_shapes.new_tensor(normalised_img_shapes)
-        else:
-            img_shapes = normalised_img_shapes
+        # Keep as python lists. Tensors break the ragged structure assumptions in pos_embed.
+        img_shapes = normalised_img_shapes
+
+        # Safety net to catch regressions early in training rather than inside pos_embed:
+        if __debug__:
+            if not (isinstance(img_shapes, list)
+                    and all(isinstance(s, list) for s in img_shapes)
+                    and all(all(isinstance(t, tuple) and len(t) == 3 for t in s) for s in img_shapes)):
+                raise AssertionError(f"Bad img_shapes structure: example={img_shapes[:1]}")
+
         txt_seq_lens = txt_seq_lens.tolist()
         vid_freqs, txt_freqs = self.pos_embed(
             img_shapes, txt_seq_lens, device=hidden_states.device
         )
+        # ---- End robust normalization of img_shapes ----
 
         return make_contiguous(
             hidden_states,
