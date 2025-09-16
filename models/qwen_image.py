@@ -122,14 +122,13 @@ def _patch_qwen_rope_for_multi_shape(pos_embed):
         vid_freqs = torch.cat(chunks, dim=0)
 
         # ---- Ensure RoPE tables are long enough for text ----
-        # Build theta on the SAME device as the cached tables to avoid CPU/CUDA mismatches in rope_params.
+        # Build theta on SAME device family as pos_freqs to prevent CPU/CUDA mismatches.
         if isinstance(self.theta, torch.Tensor):
-            theta_val = self.theta.detach().float().cpu().item()
+            theta_val = float(self.theta.detach().float().cpu().item())
         else:
             theta_val = float(self.theta)
-        theta_dev = self.pos_freqs.new_tensor(theta_val)  # 0D tensor on the right device/dtype
+        # no need to materialize a CUDA tensor for theta here; rope_params will do it
 
-        # ---- Ensure RoPE tables are long enough for text ----
         max_len = int(max(txt_seq_lens))
         need = int(max_vid_index + max_len)
         cur = int(self.pos_freqs.shape[0])
@@ -138,9 +137,9 @@ def _patch_qwen_rope_for_multi_shape(pos_embed):
             new_idx = torch.arange(cur, need, device=self.pos_freqs.device)
             pos_ext = torch.cat(
                 [
-                    self.rope_params(new_idx, self.axes_dim[0], theta_dev),
-                    self.rope_params(new_idx, self.axes_dim[1], theta_dev),
-                    self.rope_params(new_idx, self.axes_dim[2], theta_dev),
+                    self.rope_params(new_idx, self.axes_dim[0], theta_val),
+                    self.rope_params(new_idx, self.axes_dim[1], theta_val),
+                    self.rope_params(new_idx, self.axes_dim[2], theta_val),
                 ],
                 dim=1,
             ).to(self.pos_freqs.dtype)
@@ -151,9 +150,9 @@ def _patch_qwen_rope_for_multi_shape(pos_embed):
             neg_idx = -torch.arange(cur + 1, need + 1, device=self.pos_freqs.device)
             neg_ext = torch.cat(
                 [
-                    self.rope_params(neg_idx, self.axes_dim[0], theta_dev),
-                    self.rope_params(neg_idx, self.axes_dim[1], theta_dev),
-                    self.rope_params(neg_idx, self.axes_dim[2], theta_dev),
+                    self.rope_params(neg_idx, self.axes_dim[0], theta_val),
+                    self.rope_params(neg_idx, self.axes_dim[1], theta_val),
+                    self.rope_params(neg_idx, self.axes_dim[2], theta_val),
                 ],
                 dim=1,
             ).to(self.neg_freqs.dtype)
@@ -163,6 +162,36 @@ def _patch_qwen_rope_for_multi_shape(pos_embed):
         txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
         return vid_freqs, txt_freqs
 
+    # ---- Device-safe replacement for Diffusers' rope_params ----
+    def _rope_params(self, index, dim, theta=10000):
+        """
+        Computes RoPE frequencies on the SAME device as `index`, avoiding CPU/CUDA mismatches.
+        Returns complex frequencies shaped [len(index), dim//2] (same dtype semantics as upstream).
+        """
+        assert dim % 2 == 0
+        device = index.device
+        # normalize theta -> scalar float32 on correct device
+        if isinstance(theta, torch.Tensor):
+            if theta.numel() == 1:
+                theta_t = theta.detach().to(device=device, dtype=torch.float32)
+            else:
+                theta_t = torch.tensor(
+                    float(theta.detach().flatten()[0].cpu().item()),
+                    device=device,
+                    dtype=torch.float32,
+                )
+        else:
+            theta_t = torch.tensor(float(theta), device=device, dtype=torch.float32)
+
+        idx = index.to(device=device, dtype=torch.float32)
+        exp = torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim
+        freqs = torch.outer(idx, 1.0 / torch.pow(theta_t, exp))
+        # convert to cis (complex) form: cos + i*sin
+        freqs = torch.polar(torch.ones_like(freqs, device=device, dtype=freqs.dtype), freqs)
+        return freqs
+
+    # Install both patches
+    pos_embed.rope_params = types.MethodType(_rope_params, pos_embed)
     pos_embed.forward = types.MethodType(_forward, pos_embed)
     pos_embed._multi_shape_patched = True
 
