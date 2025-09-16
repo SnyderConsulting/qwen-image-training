@@ -121,7 +121,37 @@ def _patch_qwen_rope_for_multi_shape(pos_embed):
 
         vid_freqs = torch.cat(chunks, dim=0)
 
-        max_len = max(txt_seq_lens)
+        # ---- Ensure RoPE tables are long enough for text ----
+        max_len = int(max(txt_seq_lens))
+        need = int(max_vid_index + max_len)
+        cur = int(self.pos_freqs.shape[0])
+        if need > cur:
+            # Extend positive indices [cur, need)
+            new_idx = torch.arange(cur, need, device=device)
+            pos_ext = torch.cat(
+                [
+                    self.rope_params(new_idx, self.axes_dim[0], self.theta),
+                    self.rope_params(new_idx, self.axes_dim[1], self.theta),
+                    self.rope_params(new_idx, self.axes_dim[2], self.theta),
+                ],
+                dim=1,
+            ).to(self.pos_freqs.dtype)
+            self.pos_freqs = torch.cat([self.pos_freqs, pos_ext], dim=0)
+
+            # Extend negative indices to keep scale_rope math consistent for video.
+            # Existing neg_freqs correspond to [-cur, ..., -1]; prepend [-need, ..., -cur-1].
+            neg_idx = -torch.arange(cur + 1, need + 1, device=device)
+            neg_ext = torch.cat(
+                [
+                    self.rope_params(neg_idx, self.axes_dim[0], self.theta),
+                    self.rope_params(neg_idx, self.axes_dim[1], self.theta),
+                    self.rope_params(neg_idx, self.axes_dim[2], self.theta),
+                ],
+                dim=1,
+            ).to(self.neg_freqs.dtype)
+            self.neg_freqs = torch.cat([neg_ext, self.neg_freqs], dim=0)
+
+        # Now slice exactly what we need for the text stream.
         txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
         return vid_freqs, txt_freqs
 
@@ -252,6 +282,10 @@ class QwenDoubleStreamAttnProcessor2_0:
             img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
             txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
             txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+            if __debug__ and txt_query.shape[1] != txt_freqs.shape[0]:
+                raise AssertionError(
+                    f"RoPE txt mismatch: txtS={txt_query.shape[1]}, rope={txt_freqs.shape[0]}"
+                )
 
         # Concatenate for joint attention
         # Order: [text, image]
