@@ -1,7 +1,57 @@
 from typing import Optional
 import sys
 import os.path
+from functools import lru_cache
+import warnings
+
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/HunyuanVideo'))
+
+# ---------------------------------------------------------------------------
+# Transformers currently treats the presence of the ``flash_attn`` package as
+# a signal that Flash Attention kernels can be used.  However, when the
+# compiled extension is incompatible with the installed PyTorch version the
+# import fails with an ``undefined symbol`` error long after the availability
+# check.  The resulting RuntimeError bubbles up during the very first
+# ``transformers`` import and prevents the training script from starting.
+#
+# To make the integration resilient we wrap the availability predicate to
+# perform a real import of ``flash_attn`` and fall back gracefully when the
+# extension cannot be loaded.  This mirrors the behaviour users expect when the
+# optional dependency is missing altogether while still allowing fast kernels
+# to be used when they are actually functional.
+# ---------------------------------------------------------------------------
+try:
+    from transformers.utils import import_utils as _transformers_import_utils
+except Exception:  # pragma: no cover - defensive, import should normally work
+    _transformers_import_utils = None
+else:
+    _original_is_flash_attn_2_available = _transformers_import_utils.is_flash_attn_2_available
+
+    @lru_cache(maxsize=1)
+    def _has_working_flash_attn() -> bool:
+        try:
+            import flash_attn.flash_attn_interface  # noqa: F401
+        except Exception as exc:  # pragma: no cover - environment dependent
+            # Remove partially imported modules so future attempts have a clean
+            # slate and warn once to aid debugging.  Import errors include
+            # ``ModuleNotFoundError`` (package absent) and ``ImportError`` with
+            # "undefined symbol" when the binary is incompatible with PyTorch.
+            sys.modules.pop("flash_attn", None)
+            sys.modules.pop("flash_attn.flash_attn_interface", None)
+            warnings.warn(
+                "Flash Attention kernels could not be loaded ({}). Falling "
+                "back to the standard attention implementation.".format(exc),
+                RuntimeWarning,
+            )
+            return False
+        return True
+
+    def _safe_is_flash_attn_2_available() -> bool:
+        if not _original_is_flash_attn_2_available():
+            return False
+        return _has_working_flash_attn()
+
+    _transformers_import_utils.is_flash_attn_2_available = _safe_is_flash_attn_2_available
 
 import torch
 from torch import nn
