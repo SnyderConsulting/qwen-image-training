@@ -696,6 +696,28 @@ class InitialLayer(nn.Module):
         # Keep as python lists. Tensors break the ragged structure assumptions in pos_embed.
         img_shapes = normalised_img_shapes
 
+        # ---- Collapse to a single [F, H, W] triple for RoPE ----
+        # Diffusers' QwenEmbedRope only supports a single shape and does:
+        #   if isinstance(video_fhw, list): video_fhw = video_fhw[0]
+        #   frame, height, width = video_fhw
+        # Passing multiple shapes per sample (e.g. [(1,H1,W1),(1,H2,W2)]) will crash with
+        # "expected 3, got 2". We therefore pick the first valid triple across the batch.
+        flat_fhws: list = []
+        for sample in img_shapes:
+            for fhw in sample:
+                # tuples already enforced above; keep ints
+                flat_fhws.append((int(fhw[0]), int(fhw[1]), int(fhw[2])))
+        if not flat_fhws:
+            raise ValueError("img_shapes is empty after normalization")
+
+        # Choose the first triple (matches how existing pipelines pass [[F,H,W]]).
+        # If you prefer, replace with a policy like max area:
+        # fhw_for_rope = max(flat_fhws, key=lambda t: t[1]*t[2])
+        fhw_for_rope = list(flat_fhws[0])
+
+        # What RoPE expects: either [F,H,W] or [[F,H,W]]. We pass [[F,H,W]].
+        img_shapes_for_rope = [fhw_for_rope]
+
         # Safety net to catch regressions early in training rather than inside pos_embed:
         if __debug__:
             if not (isinstance(img_shapes, list)
@@ -705,7 +727,7 @@ class InitialLayer(nn.Module):
 
         txt_seq_lens = txt_seq_lens.tolist()
         vid_freqs, txt_freqs = self.pos_embed(
-            img_shapes, txt_seq_lens, device=hidden_states.device
+            img_shapes_for_rope, txt_seq_lens, device=hidden_states.device
         )
         # ---- End robust normalization of img_shapes ----
 
