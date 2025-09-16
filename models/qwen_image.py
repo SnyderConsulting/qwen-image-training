@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import Union, Tuple, Optional
 import math
+import types
 
 import torch
 from torch import nn
@@ -26,6 +27,106 @@ from utils.offloading import ModelOffloader
 
 
 KEEP_IN_HIGH_PRECISION = ["time_text_embed", "img_in", "txt_in", "norm_out", "proj_out"]
+
+
+def _patch_qwen_rope_for_multi_shape(pos_embed):
+    """Monkey-patch Qwen's rotary embedding module to support packed image shapes.
+
+    The upstream implementation only accepts a single (F, H, W) triple and silently
+    drops any additional entries when provided with a list. Training data that packs
+    multiple crops per sample therefore builds the rotary frequencies for the first
+    crop only, causing mismatched sequence lengths once the image tokens are
+    concatenated.
+
+    This helper widens the forward implementation so that callers can pass
+    per-sample lists of (frame, height, width) tuples. The rotary frequencies for
+    each shape are generated individually and concatenated, matching the actual
+    image token layout.
+    """
+
+    if getattr(pos_embed, "_multi_shape_patched", False):
+        return
+
+    def _forward(self, video_fhw, txt_seq_lens, device):
+        if isinstance(txt_seq_lens, torch.Tensor):
+            txt_seq_lens = txt_seq_lens.detach().cpu().tolist()
+
+        if self.pos_freqs.device != device:
+            self.pos_freqs = self.pos_freqs.to(device)
+            self.neg_freqs = self.neg_freqs.to(device)
+
+        shapes = video_fhw
+        if isinstance(shapes, torch.Tensor):
+            shapes = shapes.detach().cpu().tolist()
+
+        # Batched input: [[(F,H,W), ...], ...] -> assume shared packing and take the first sample.
+        if (
+            isinstance(shapes, (list, tuple))
+            and len(shapes) > 0
+            and isinstance(shapes[0], (list, tuple))
+            and len(shapes[0]) > 0
+            and isinstance(shapes[0][0], (list, tuple))
+        ):
+            shapes = shapes[0]
+
+        # Single triple or tensor -> wrap into a list for downstream loops.
+        if (
+            isinstance(shapes, (list, tuple))
+            and len(shapes) == 3
+            and all(isinstance(x, (int, float)) for x in shapes)
+        ):
+            shapes = [shapes]
+
+        if not (
+            isinstance(shapes, list)
+            and all(isinstance(s, (list, tuple)) and len(s) == 3 for s in shapes)
+        ):
+            raise TypeError(f"Unexpected format for video_fhw: {type(video_fhw)} -> {shapes}")
+
+        shapes = [(int(f), int(h), int(w)) for f, h, w in shapes]
+        if not shapes:
+            raise ValueError("video_fhw is empty after normalization")
+
+        chunks = []
+        max_vid_index = 0
+        for f, h, w in shapes:
+            rope_key = f"{f}_{h}_{w}"
+            if rope_key not in self.rope_cache:
+                seq_lens = f * h * w
+                freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+                freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+                freqs_frame = freqs_pos[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1)
+                if self.scale_rope:
+                    freqs_height = torch.cat(
+                        [freqs_neg[1][-(h - h // 2):], freqs_pos[1][: h // 2]], dim=0
+                    )
+                    freqs_height = freqs_height.view(1, h, 1, -1).expand(f, h, w, -1)
+                    freqs_width = torch.cat(
+                        [freqs_neg[2][-(w - w // 2):], freqs_pos[2][: w // 2]], dim=0
+                    )
+                    freqs_width = freqs_width.view(1, 1, w, -1).expand(f, h, w, -1)
+                else:
+                    freqs_height = freqs_pos[1][:h].view(1, h, 1, -1).expand(f, h, w, -1)
+                    freqs_width = freqs_pos[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+                freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
+                self.rope_cache[rope_key] = freqs.clone().contiguous()
+            chunks.append(self.rope_cache[rope_key])
+
+            if self.scale_rope:
+                vid_index = max(h // 2, w // 2)
+            else:
+                vid_index = max(h, w)
+            if vid_index > max_vid_index:
+                max_vid_index = vid_index
+
+        vid_freqs = torch.cat(chunks, dim=0)
+
+        max_len = max(txt_seq_lens)
+        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        return vid_freqs, txt_freqs
+
+    pos_embed.forward = types.MethodType(_forward, pos_embed)
+    pos_embed._multi_shape_patched = True
 
 
 def apply_rotary_emb_qwen(
@@ -307,6 +408,8 @@ class QwenImagePipeline(BasePipeline):
         attn_processor = QwenDoubleStreamAttnProcessor2_0()
         for block in transformer.transformer_blocks:
             block.attn.set_processor(attn_processor)
+
+        _patch_qwen_rope_for_multi_shape(transformer.pos_embed)
 
         self.diffusers_pipeline.transformer = transformer
 
@@ -693,32 +796,8 @@ class InitialLayer(nn.Module):
                 sample_list.append((int(frame), int(height), int(width)))
             normalised_img_shapes.append(sample_list)
 
-        # Keep as python lists. Tensors break the ragged structure assumptions in pos_embed.
+        # Keep as python lists (samples -> list of (F,H,W) shapes)
         img_shapes = normalised_img_shapes
-
-        # ---- Collapse to a single [F, H, W] triple for RoPE ----
-        # Diffusers' QwenEmbedRope only supports a single shape and does:
-        #   if isinstance(video_fhw, list): video_fhw = video_fhw[0]
-        #   frame, height, width = video_fhw
-        # Passing multiple shapes per sample (e.g. [(1,H1,W1),(1,H2,W2)]) will crash with
-        # "expected 3, got 2". We therefore pick the first valid triple across the batch.
-        flat_fhws: list = []
-        for sample in img_shapes:
-            for fhw in sample:
-                # tuples already enforced above; keep ints
-                flat_fhws.append((int(fhw[0]), int(fhw[1]), int(fhw[2])))
-        if not flat_fhws:
-            raise ValueError("img_shapes is empty after normalization")
-
-        # Choose the first triple (matches how existing pipelines pass [[F,H,W]]).
-        # If you prefer, replace with a policy like max area:
-        # fhw_for_rope = max(flat_fhws, key=lambda t: t[1]*t[2])
-        fhw_for_rope = list(flat_fhws[0])
-
-        # What RoPE expects: either [F,H,W] or [[F,H,W]]. We pass [[F,H,W]].
-        img_shapes_for_rope = [fhw_for_rope]
-
-        # Safety net to catch regressions early in training rather than inside pos_embed:
         if __debug__:
             if not (isinstance(img_shapes, list)
                     and all(isinstance(s, list) for s in img_shapes)
@@ -726,9 +805,11 @@ class InitialLayer(nn.Module):
                 raise AssertionError(f"Bad img_shapes structure: example={img_shapes[:1]}")
 
         txt_seq_lens = txt_seq_lens.tolist()
-        vid_freqs, txt_freqs = self.pos_embed(
-            img_shapes_for_rope, txt_seq_lens, device=hidden_states.device
-        )
+        vid_freqs, txt_freqs = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+        if __debug__ and hidden_states.shape[1] != vid_freqs.shape[0]:
+            raise AssertionError(
+                f"RoPE seq-len mismatch: hidden={hidden_states.shape[1]}, rope={vid_freqs.shape[0]}, img_shapes[0]={img_shapes[0]}"
+            )
         # ---- End robust normalization of img_shapes ----
 
         return make_contiguous(
