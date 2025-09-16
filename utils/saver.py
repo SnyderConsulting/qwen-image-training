@@ -1,4 +1,5 @@
 from pathlib import Path
+import importlib.util
 import os
 import shutil
 import time
@@ -9,6 +10,22 @@ from deepspeed import comm as dist
 from deepspeed.utils.logging import logger
 
 from utils.common import is_main_process
+
+
+_TORCH_ZIPFILE_AVAILABLE = importlib.util.find_spec("torch.utils.serialization") is not None
+
+
+def _save_state_dict(state_dict, destination):
+    """Persist a state dict, falling back to the legacy format if needed."""
+
+    save_kwargs = {}
+    if not _TORCH_ZIPFILE_AVAILABLE:
+        # Older PyTorch builds may omit torch.utils.serialization, which is
+        # required by the default zipfile-based saver.  In that case, switch to
+        # the legacy pickled format to avoid triggering a ModuleNotFoundError
+        # during checkpointing.
+        save_kwargs["_use_new_zipfile_serialization"] = False
+    torch.save(state_dict, destination, **save_kwargs)
 
 
 def convert_state_dict_dtype(state_dict, dtype):
@@ -74,7 +91,7 @@ class Saver:
                     partial_state_dict[p.original_name.replace('.default', '').replace('.modules_to_save', '')] = p.detach()
                     if 'save_dtype' in self.config:
                         convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
-            torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
+            _save_state_dict(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
         dist.barrier()
         if dp_id == 0 and stage_id == 0:
             state_dict = {}
@@ -97,7 +114,7 @@ class Saver:
             partial_state_dict = {p.original_name: p.detach() for p in self.pipeline_model.parameters() if hasattr(p, 'original_name')}
             if 'save_dtype' in self.config:
                 convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
-            torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
+            _save_state_dict(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
         dist.barrier()
         if dp_id == 0 and stage_id == 0:
             state_dict = {}
