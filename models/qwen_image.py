@@ -122,17 +122,25 @@ def _patch_qwen_rope_for_multi_shape(pos_embed):
         vid_freqs = torch.cat(chunks, dim=0)
 
         # ---- Ensure RoPE tables are long enough for text ----
+        # Build theta on the SAME device as the cached tables to avoid CPU/CUDA mismatches in rope_params.
+        if isinstance(self.theta, torch.Tensor):
+            theta_val = self.theta.detach().float().cpu().item()
+        else:
+            theta_val = float(self.theta)
+        theta_dev = self.pos_freqs.new_tensor(theta_val)  # 0D tensor on the right device/dtype
+
+        # ---- Ensure RoPE tables are long enough for text ----
         max_len = int(max(txt_seq_lens))
         need = int(max_vid_index + max_len)
         cur = int(self.pos_freqs.shape[0])
         if need > cur:
             # Extend positive indices [cur, need)
-            new_idx = torch.arange(cur, need, device=device)
+            new_idx = torch.arange(cur, need, device=self.pos_freqs.device)
             pos_ext = torch.cat(
                 [
-                    self.rope_params(new_idx, self.axes_dim[0], self.theta),
-                    self.rope_params(new_idx, self.axes_dim[1], self.theta),
-                    self.rope_params(new_idx, self.axes_dim[2], self.theta),
+                    self.rope_params(new_idx, self.axes_dim[0], theta_dev),
+                    self.rope_params(new_idx, self.axes_dim[1], theta_dev),
+                    self.rope_params(new_idx, self.axes_dim[2], theta_dev),
                 ],
                 dim=1,
             ).to(self.pos_freqs.dtype)
@@ -140,12 +148,12 @@ def _patch_qwen_rope_for_multi_shape(pos_embed):
 
             # Extend negative indices to keep scale_rope math consistent for video.
             # Existing neg_freqs correspond to [-cur, ..., -1]; prepend [-need, ..., -cur-1].
-            neg_idx = -torch.arange(cur + 1, need + 1, device=device)
+            neg_idx = -torch.arange(cur + 1, need + 1, device=self.pos_freqs.device)
             neg_ext = torch.cat(
                 [
-                    self.rope_params(neg_idx, self.axes_dim[0], self.theta),
-                    self.rope_params(neg_idx, self.axes_dim[1], self.theta),
-                    self.rope_params(neg_idx, self.axes_dim[2], self.theta),
+                    self.rope_params(neg_idx, self.axes_dim[0], theta_dev),
+                    self.rope_params(neg_idx, self.axes_dim[1], theta_dev),
+                    self.rope_params(neg_idx, self.axes_dim[2], theta_dev),
                 ],
                 dim=1,
             ).to(self.neg_freqs.dtype)
