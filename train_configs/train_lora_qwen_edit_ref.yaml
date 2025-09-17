@@ -4,6 +4,7 @@ img_dir: "/workspace/qwen-image-training/extracted_dataset/train/images"
 control_dir: "/workspace/qwen-image-training/extracted_dataset/train/control"
 output_dir: "/workspace/qwen-image-training/outputs/qwen_edit_lora_ref"
 logging_dir: "logs"
+report_to: "tensorboard"
 
 # --- training ---
 resolution: 1024
