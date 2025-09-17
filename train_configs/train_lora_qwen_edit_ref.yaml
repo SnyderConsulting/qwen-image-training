@@ -3,6 +3,7 @@ pretrained_model_name_or_path: "Qwen/Qwen-Image-Edit"
 img_dir: "/workspace/qwen-image-training/extracted_dataset/train/images"
 control_dir: "/workspace/qwen-image-training/extracted_dataset/train/control"
 output_dir: "/workspace/qwen-image-training/outputs/qwen_edit_lora_ref"
+logging_dir: "logs"
 
 # --- training ---
 resolution: 1024
